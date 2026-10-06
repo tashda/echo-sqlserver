@@ -238,8 +238,10 @@ public final class SQLServerActivityMonitor: @unchecked Sendable {
         }
     }
 
-    private func fetchProcesses(options: SQLServerActivityOptions, on loop: EventLoop) -> EventLoopFuture<[SQLServerProcessInfo]> {
-        let sql = """
+    /// The statement behind the process list. The plan is the biggest part of a row (tens of kilobytes) and nothing
+    /// shows it, so it is only read when `options.includeQueryPlan` asks.
+    static func processesSQL(options: SQLServerActivityOptions) -> String {
+        return """
         SELECT
             s.session_id,
             s.login_name,
@@ -262,16 +264,21 @@ public final class SQLServerActivityMonitor: @unchecked Sendable {
             r.database_id,
             r.start_time,
             r.percent_complete,
-            st.text AS sql_text,
-            CAST(qp.query_plan AS NVARCHAR(MAX)) AS plan_xml
+            \(options.includeSqlText ? "st.text" : "CAST(NULL AS NVARCHAR(MAX))") AS sql_text,
+            \(options.includeQueryPlan ? "CAST(qp.query_plan AS NVARCHAR(MAX))" : "CAST(NULL AS NVARCHAR(MAX))") AS plan_xml
         FROM sys.dm_exec_sessions AS s
         LEFT JOIN sys.dm_exec_connections AS c ON c.session_id = s.session_id
         LEFT JOIN sys.dm_exec_requests   AS r ON r.session_id = s.session_id
-        OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS st
-        OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) AS qp
+        \(options.includeSqlText ? "OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS st" : "")
+        \(options.includeQueryPlan ? "OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) AS qp" : "")
         WHERE s.session_id <> @@SPID
         ORDER BY s.session_id;
         """
+
+    }
+
+    private func fetchProcesses(options: SQLServerActivityOptions, on loop: EventLoop) -> EventLoopFuture<[SQLServerProcessInfo]> {
+        let sql = Self.processesSQL(options: options)
 
         return client.query(sql, on: loop).map { rows in
             rows.compactMap { row in
@@ -368,8 +375,10 @@ public final class SQLServerActivityMonitor: @unchecked Sendable {
         }
     }
 
-    private func fetchExpensiveQueries(options: SQLServerActivityOptions, on loop: EventLoop) -> EventLoopFuture<[SQLServerExpensiveQuery]> {
-        let sql = """
+    /// The statement behind the expensive-queries list: twenty rows, each with its text and, only when
+    /// `options.includeQueryPlan` asks, its whole plan (megabytes every refresh).
+    static func expensiveQueriesSQL(options: SQLServerActivityOptions) -> String {
+        return """
         SELECT TOP (20)
             qs.query_hash,
             qs.execution_count,
@@ -380,18 +389,23 @@ public final class SQLServerActivityMonitor: @unchecked Sendable {
             qs.max_worker_time,
             qs.max_elapsed_time,
             qs.last_execution_time,
-            st.text AS sql_text,
-            CAST(qp.query_plan AS NVARCHAR(MAX)) AS plan_xml,
+            \(options.includeSqlText ? "st.text" : "CAST(NULL AS NVARCHAR(MAX))") AS sql_text,
+            \(options.includeQueryPlan ? "CAST(qp.query_plan AS NVARCHAR(MAX))" : "CAST(NULL AS NVARCHAR(MAX))") AS plan_xml,
             DB_NAME(CONVERT(INT, pa.value)) AS database_name
         FROM sys.dm_exec_query_stats AS qs
-        OUTER APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
-        OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
+        \(options.includeSqlText ? "OUTER APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st" : "")
+        \(options.includeQueryPlan ? "OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp" : "")
         OUTER APPLY (
             SELECT TOP(1) value FROM sys.dm_exec_plan_attributes(qs.plan_handle)
             WHERE attribute = 'dbid'
         ) AS pa
         ORDER BY qs.total_worker_time DESC;
         """
+
+    }
+
+    private func fetchExpensiveQueries(options: SQLServerActivityOptions, on loop: EventLoop) -> EventLoopFuture<[SQLServerExpensiveQuery]> {
+        let sql = Self.expensiveQueriesSQL(options: options)
 
         return client.query(sql, on: loop).map { rows in
             rows.enumerated().map { index, row in
