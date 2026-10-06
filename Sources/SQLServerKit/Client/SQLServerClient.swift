@@ -23,15 +23,24 @@ public final class SQLServerClient: @unchecked Sendable {
     internal var inFlightOperations: Int = 0
     internal var drainWaiters: [EventLoopPromise<Void>] = []
 
+    /// The event loops every client made without a thread count shares. A loop thread serves any number of connections, so a
+    /// client per server (or per database) must not start a group of threads of its own: four connections to as many servers
+    /// took the app from 8 to 42 threads. Never shut down; a client that uses it does not own it.
+    internal static let sharedEventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: min(System.coreCount, 4))
+
     public static func connect(
         configuration: Configuration,
         logger: Logger = Logger(label: "tds.sqlserver.client")
     ) async throws -> SQLServerClient {
-        try await connect(
-            configuration: configuration,
-            numberOfThreads: min(System.coreCount, 4),
-            logger: logger
-        )
+        do {
+            return try await connect(
+                configuration: configuration,
+                eventLoopGroupProvider: .shared(sharedEventLoopGroup),
+                logger: logger
+            ).get()
+        } catch {
+            throw SQLServerError.normalize(error)
+        }
     }
 
     public static func connect(
