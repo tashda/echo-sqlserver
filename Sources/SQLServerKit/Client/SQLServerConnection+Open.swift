@@ -115,6 +115,8 @@ extension SQLServerConnection {
         let pending = NIOLockedValueBox<TDSConnection?>(nil)
         let completed = NIOLockedValueBox(false)
         let seconds = max(1, cfg.connectTimeoutSeconds)
+        // Where the attempt is, for the message when the time runs out.
+        let stage = NIOLockedValueBox("resolving \(cfg.hostname)")
 
         func finish(_ result: Result<TDSConnection, Error>) {
             let first = completed.withLockedValue { done -> Bool in
@@ -131,27 +133,32 @@ extension SQLServerConnection {
 
         let deadline = eventLoop.scheduleTask(in: .seconds(Int64(seconds))) {
             finish(.failure(SQLServerError.timeout(
-                description: "login to \(cfg.hostname):\(cfg.port) did not complete within \(seconds)s",
+                description: "login to \(cfg.hostname):\(cfg.port) did not complete within \(seconds)s (\(stage.withLockedValue { $0 }))",
                 underlying: nil
             )))
             pending.withLockedValue { $0 }?.closeSilently()
         }
 
         func connect(host: String, port: Int, redirects: Int) -> EventLoopFuture<TDSConnection> {
-            resolveSocketAddresses(hostname: host, port: port, transparentResolution: cfg.transparentNetworkIPResolution, on: eventLoop)
+            stage.withLockedValue { $0 = "resolving \(host)" }
+            return resolveSocketAddresses(hostname: host, port: port, transparentResolution: cfg.transparentNetworkIPResolution, on: eventLoop)
                 .flatMap { addresses in
-                    establishTDSConnection(
+                    stage.withLockedValue { $0 = "\(host) resolved to \(addresses.map(SQLServerAddressRace.describe).joined(separator: ", ")); connecting" }
+                    return establishTDSConnection(
                         addresses: addresses,
                         tlsConfiguration: cfg.effectiveTLSConfiguration,
                         serverHostname: redirects == 0 ? (cfg.hostNameInCertificate ?? host) : host,
                         encryptionMode: cfg.encryptionMode.asTDSMode,
                         connectTimeout: .seconds(Int64(seconds)),
+                        parallel: cfg.transparentNetworkIPResolution,
+                        progress: { text in stage.withLockedValue { $0 = "\(host) resolved to several addresses; \(text)" } },
                         on: eventLoop,
                         logger: logger
                     )
                 }
                 .flatMap { connection in
                     pending.withLockedValue { $0 = connection }
+                    stage.withLockedValue { $0 = "connected and encrypted; waiting for \(host) to answer the sign-in (Windows or SQL login)" }
                     let login = TDSLoginConfiguration(
                         serverName: host,
                         port: port,
@@ -202,6 +209,7 @@ extension SQLServerConnection {
                 pending.withLockedValue { $0 = connection }
                 let batch = cfg.sessionBootstrapBatch
                 guard !batch.isEmpty else { return eventLoop.makeSucceededFuture(connection) }
+                stage.withLockedValue { $0 = "signed in; setting up the session" }
                 return runSessionBatch(batch, on: connection).map { connection }.flatMapError { error in
                     connection.close().recover { _ in }.flatMapThrowing { throw SQLServerError.normalize(error) }
                 }
@@ -385,33 +393,60 @@ extension SQLServerConnection {
         return ordered
     }
 
+    /// Opens a TDS connection to the first of `addresses` that answers.
+    /// With `parallel` (TransparentNetworkIPResolution, on by default) the
+    /// addresses are raced; without it they are tried one after the other,
+    /// each given the whole `connectTimeout`.
     internal static func establishTDSConnection(
         addresses: [SocketAddress],
         tlsConfiguration: TLSConfiguration?,
         serverHostname: String?,
         encryptionMode: TDSEncryptionMode = .mandatory,
         connectTimeout: TimeAmount,
+        parallel: Bool = true,
+        progress: @escaping @Sendable (String) -> Void = { _ in },
         on eventLoop: EventLoop,
         logger: Logger
     ) -> EventLoopFuture<TDSConnection> {
         @Sendable
-        func attempt(_ remaining: ArraySlice<SocketAddress>, lastError: Error?) -> EventLoopFuture<TDSConnection> {
-            guard let next = remaining.first else {
-                return eventLoop.makeFailedFuture(lastError ?? SQLServerError.connectionClosed)
-            }
-            return TDSConnection.connect(
-                to: next,
+        func connect(to address: SocketAddress) -> EventLoopFuture<TDSConnection> {
+            TDSConnection.connect(
+                to: address,
                 tlsConfiguration: tlsConfiguration,
                 serverHostname: serverHostname,
                 encryptionMode: encryptionMode,
                 connectTimeout: connectTimeout,
                 on: eventLoop,
                 logger: logger
-            ).flatMapError { error in
-                // Only a failure to reach the address moves on to the next
-                // one. TLS or protocol failures come from the server itself.
-                let normalized = SQLServerError.normalize(error)
-                guard remaining.count > 1, case .transient = normalized else {
+            )
+        }
+        // Only a failure to reach the address moves on to the next one.
+        // TLS or protocol failures come from the server itself.
+        @Sendable
+        func isUnreachable(_ error: Error) -> Bool {
+            if case .transient = SQLServerError.normalize(error) { return true }
+            return false
+        }
+
+        if parallel, addresses.count > 1 {
+            return SQLServerAddressRace.run(
+                addresses: addresses,
+                on: eventLoop,
+                attempt: connect(to:),
+                discard: { $0.closeSilently() },
+                isUnreachable: isUnreachable,
+                progress: progress
+            )
+        }
+
+        @Sendable
+        func attempt(_ remaining: ArraySlice<SocketAddress>, lastError: Error?) -> EventLoopFuture<TDSConnection> {
+            guard let next = remaining.first else {
+                return eventLoop.makeFailedFuture(lastError ?? SQLServerError.connectionClosed)
+            }
+            progress("connecting: no answer yet from \(SQLServerAddressRace.describe(next))")
+            return connect(to: next).flatMapError { error in
+                guard remaining.count > 1, isUnreachable(error) else {
                     return eventLoop.makeFailedFuture(error)
                 }
                 logger.debug("Could not reach \(next); trying next address")
